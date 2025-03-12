@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BlackHole</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        border: none;
+      }
+      canvas {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="canvas" width="1600" height="800"></div>
+    <canvas id="glscreen"></canvas>
+
+    <script>
+      (() => {
+        // Configuration
+        const CONFIG = {
+          bgUrl: 'stars.jpg',
+          blackholeMass: 1500,
+          blackholeMassIncrementFactor: 0.03,
+          clickIncrementFactor: 0.03,
+          clickDecrementFactor: 0.015,
+          mouseAutoMovementSinFactorY: 0.7,
+          mouseAutoMovementSinFactorX: 0.6,
+          mouseAutoAmplitudeFactorY: 0.25,
+          mouseAutoAmplitudeFactorX: 0.35,
+        };
+
+        // State
+        const STATE = {
+          curBlackholeMass: 0,
+          canvas: null,
+          gl: null,
+          program: null,
+          startTime: new Date().getTime(),
+          currentTime: 0,
+          clicked: false,
+          clickedTime: 0,
+          mouse: {
+            x: 0,
+            y: 0,
+            moved: false,
+          },
+          uniformLocations: {
+            resolution: null,
+            mouse: null,
+            mass: null,
+            time: null,
+            clickedTime: null,
+          },
+        };
+
+        // Shader source code
+        const SHADERS = {
+          vertex: `
+            attribute vec2 a_position;
+            attribute vec2 a_texCoord;
+
+            varying vec2 v_texCoord;
+            void main() {
+                gl_Position = vec4(a_position, 0, 1);
+                v_texCoord = a_position * 0.5 + 0.5;
+            }`,
+          fragment: `
+            #ifdef GL_ES
+            precision mediump float;
+            #endif
+
+            #define PI 3.14159265359
+
+            uniform sampler2D u_image;
+            varying vec2 v_texCoord;
+
+            uniform vec2 u_resolution;
+            uniform vec2 u_mouse;
+            uniform float u_mass;
+            uniform float u_time;
+            uniform float u_clickedTime;
+
+            mat2 rotate(float angle) {
+              float s = sin(angle);
+              float c = cos(angle);
+
+              return mat2(c, -s, s, c);
+            }
+
+            vec2 lensing(vec2 mt, vec2 st, float angle) {
+                float cos = cos(angle * PI);
+                vec2 diff = st - mt;
+
+                return (cos * diff + mt);
+            }
+
+            void main() {
+                // pixel coordinates
+                vec2 st = v_texCoord;
+
+                // mouse coordinates
+                vec2 mt = vec2(u_mouse.x, u_resolution.y - u_mouse.y) / u_resolution;
+
+                float dx = st.x - mt.x;
+                float dy = st.y - mt.y;
+
+                float dist = sqrt(dx * dx + dy * dy);
+                float pull = u_mass / (dist * dist);
+
+                vec2 r = lensing(mt, st, pull);
+                vec3 image = texture2D(u_image, st).xyz;
+                vec3 rotated = texture2D(u_image, r).xyz;
+
+                // dark shadow round the mouse cursor
+                rotated -= pull * 0.4;
+
+                gl_FragColor = vec4(mix(image, rotated, min(pull, 1.0)), 1.0);
+            }`,
+        };
+
+        // Event handlers
+        function setupEventListeners() {
+          document.addEventListener('mousedown', () => {
+            STATE.clicked = true;
+          });
+
+          document.addEventListener('mouseup', () => {
+            STATE.clicked = false;
+          });
+
+          document.addEventListener('mousemove', (e) => {
+            STATE.mouse.x = e.pageX;
+            STATE.mouse.y = e.pageY;
+            STATE.mouse.moved = true;
+          });
+
+          window.addEventListener('resize', handleResize);
+        }
+
+        function handleResize() {
+          updateCanvasSize();
+
+          const { gl, uniformLocations } = STATE;
+          gl.viewport(0, 0, STATE.canvas.width, STATE.canvas.height);
+          gl.uniform2f(
+            uniformLocations.resolution,
+            STATE.canvas.width,
+            STATE.canvas.height
+          );
+        }
+
+        // Utility functions
+        function updateCanvasSize() {
+          STATE.canvas.width = Math.max(window.innerWidth, window.innerHeight);
+          STATE.canvas.height = Math.max(window.innerWidth, window.innerHeight);
+        }
+
+        function compileShader(gl, type, source) {
+          const shader = gl.createShader(type);
+          gl.shaderSource(shader, source);
+          gl.compileShader(shader);
+
+          if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.error(
+              `ERROR compiling ${
+                type === gl.VERTEX_SHADER ? 'vertex' : 'fragment'
+              } shader!`,
+              gl.getShaderInfoLog(shader)
+            );
+            return null;
+          }
+
+          return shader;
+        }
+
+        function createShaderProgram(gl, vertexSource, fragmentSource) {
+          const vertexShader = compileShader(
+            gl,
+            gl.VERTEX_SHADER,
+            vertexSource
+          );
+          const fragmentShader = compileShader(
+            gl,
+            gl.FRAGMENT_SHADER,
+            fragmentSource
+          );
+
+          if (!vertexShader || !fragmentShader) {
+            return null;
+          }
+
+          const program = gl.createProgram();
+          gl.attachShader(program, vertexShader);
+          gl.attachShader(program, fragmentShader);
+          gl.linkProgram(program);
+
+          if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+            console.error(
+              'ERROR linking program!',
+              gl.getProgramInfoLog(program)
+            );
+            return null;
+          }
+
+          return program;
+        }
+
+        function setupBuffers(gl) {
+          const buffer = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+          gl.bufferData(
+            gl.ARRAY_BUFFER,
+            new Float32Array([
+              -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
+            ]),
+            gl.STATIC_DRAW
+          );
+          return buffer;
+        }
+
+        function setupTexture(gl, image) {
+          const texture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+          gl.texImage2D(
+            gl.TEXTURE_2D,
+            0,
+            gl.RGBA,
+            gl.RGBA,
+            gl.UNSIGNED_BYTE,
+            image
+          );
+
+          return texture;
+        }
+
+        function getUniformLocations(gl, program) {
+          return {
+            resolution: gl.getUniformLocation(program, 'u_resolution'),
+            mouse: gl.getUniformLocation(program, 'u_mouse'),
+            mass: gl.getUniformLocation(program, 'u_mass'),
+            time: gl.getUniformLocation(program, 'u_time'),
+            clickedTime: gl.getUniformLocation(program, 'u_clickedTime'),
+          };
+        }
+
+        function initializeWebGL(image) {
+          // Set up canvas and WebGL context
+          STATE.canvas = document.getElementById('glscreen');
+          STATE.gl =
+            STATE.canvas.getContext('webgl') ||
+            STATE.canvas.getContext('experimental-webgl');
+
+          if (!STATE.gl) {
+            console.error('WebGL not supported');
+            return false;
+          }
+
+          updateCanvasSize();
+
+          const { gl } = STATE;
+
+          // Initialize mouse position
+          STATE.mouse = {
+            x: window.innerWidth / 2,
+            y: -window.innerHeight / 2 + STATE.canvas.height,
+            moved: false,
+          };
+
+          // Set viewport
+          gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+
+          // Create buffer
+          setupBuffers(gl);
+
+          // Create shader program
+          STATE.program = createShaderProgram(
+            gl,
+            SHADERS.vertex,
+            SHADERS.fragment
+          );
+
+          if (!STATE.program) {
+            return false;
+          }
+
+          gl.useProgram(STATE.program);
+
+          // Get uniform locations
+          STATE.uniformLocations = getUniformLocations(gl, STATE.program);
+
+          // Set initial uniform values
+          gl.uniform2f(
+            STATE.uniformLocations.resolution,
+            STATE.canvas.width,
+            STATE.canvas.height
+          );
+          gl.uniform2f(
+            STATE.uniformLocations.mouse,
+            STATE.mouse.x,
+            STATE.mouse.y
+          );
+          gl.uniform1f(
+            STATE.uniformLocations.mass,
+            STATE.curBlackholeMass * 0.00001
+          );
+          gl.uniform1f(STATE.uniformLocations.time, STATE.currentTime);
+          gl.uniform1f(STATE.uniformLocations.clickedTime, STATE.clickedTime);
+
+          // Set up position attribute
+          const positionLocation = gl.getAttribLocation(
+            STATE.program,
+            'a_position'
+          );
+          gl.enableVertexAttribArray(positionLocation);
+          gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+          // Create texture
+          setupTexture(gl, image);
+
+          return true;
+        }
+
+        function updateState() {
+          const now = new Date().getTime();
+          STATE.currentTime = (now - STATE.startTime) / 1000;
+
+          // Update black hole mass
+          if (STATE.curBlackholeMass < CONFIG.blackholeMass - 50) {
+            STATE.curBlackholeMass +=
+              (CONFIG.blackholeMass - STATE.curBlackholeMass) *
+              CONFIG.blackholeMassIncrementFactor;
+          }
+
+          // Update clicked time
+          if (STATE.clicked) {
+            STATE.clickedTime += CONFIG.clickIncrementFactor;
+          } else if (STATE.clickedTime > 0) {
+            STATE.clickedTime -=
+              STATE.clickedTime * CONFIG.clickDecrementFactor;
+          }
+
+          // Automatic mouse movement when not manually moved
+          if (!STATE.mouse.moved) {
+            const { innerWidth, innerHeight } = window;
+
+            STATE.mouse.y =
+              -(innerHeight / 2) +
+              Math.sin(STATE.currentTime * CONFIG.mouseAutoMovementSinFactorY) *
+                (innerHeight * CONFIG.mouseAutoAmplitudeFactorY) +
+              STATE.canvas.height;
+
+            STATE.mouse.x =
+              innerWidth / 2 +
+              Math.sin(STATE.currentTime * CONFIG.mouseAutoMovementSinFactorX) *
+                -(innerWidth * CONFIG.mouseAutoAmplitudeFactorX);
+          }
+        }
+
+        function updateUniforms() {
+          const { gl, uniformLocations } = STATE;
+
+          gl.uniform1f(uniformLocations.mass, STATE.curBlackholeMass * 0.00001);
+          gl.uniform2f(uniformLocations.mouse, STATE.mouse.x, STATE.mouse.y);
+          gl.uniform1f(uniformLocations.time, STATE.currentTime);
+          gl.uniform1f(uniformLocations.clickedTime, STATE.clickedTime);
+        }
+
+        function render() {
+          updateState();
+          updateUniforms();
+
+          // Request next frame
+          window.requestAnimationFrame(render);
+
+          // Draw
+          STATE.gl.drawArrays(STATE.gl.TRIANGLES, 0, 6);
+        }
+
+        function init() {
+          setupEventListeners();
+
+          const image = new Image();
+          image.crossOrigin = 'Anonymous';
+          image.src = CONFIG.bgUrl;
+
+          image.onload = function () {
+            if (initializeWebGL(image)) {
+              render();
+            }
+          };
+
+          image.onerror = function () {
+            console.error('Error loading image:', CONFIG.bgUrl);
+          };
+        }
+
+        // Start the application
+        window.addEventListener('load', init);
+      })();
+    </script>
+  </body>
+</html>
